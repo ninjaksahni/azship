@@ -555,10 +555,8 @@ with tab5:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
     st.markdown("### 💡 Recommendations")
-    st.caption("Based on your last 30 days of shipment data. All insights are derived automatically from the CSV you uploaded.")
     st.divider()
 
-    # ── Helper: min distance from city to nearest FC ──────────────────────────
     def nearest_fc_distance(city):
         coords = CITY_COORDS.get(city)
         if not coords:
@@ -572,41 +570,139 @@ with tab6:
                 nearest = fc
         return nearest, round(min_dist)
 
-    # ── 1. States underserved by warehouses ───────────────────────────────────
-    st.markdown("<div class='section-title'>🏗️ States that could use a new warehouse</div>", unsafe_allow_html=True)
+    # Calculate global medians
+    city_metrics = fdf.groupby("City").agg(Orders=("SKU", "size"), Revenue=("Revenue", "sum")).reset_index()
+    median_city_orders = city_metrics["Orders"].median()
+    
+    sku_metrics = fdf.groupby("SKU").agg(Orders=("City", "size"), Revenue=("Revenue", "sum")).reset_index()
+    median_sku_orders = sku_metrics["Orders"].median()
 
-    state_orders = fdf.groupby(["State", "City"]).size().reset_index(name="Orders")
-    state_orders["lat"] = state_orders["City"].map(lambda c: CITY_COORDS.get(c, (None, None))[0])
-    state_orders["lon"] = state_orders["City"].map(lambda c: CITY_COORDS.get(c, (None, None))[1])
-    state_orders = state_orders.dropna(subset=["lat", "lon"])
+    # ── 1. States underserved by warehouses (Sorted by Volume) ────────────────
+    st.markdown("<div class='section-title'>🏗️ High-Volume States Requiring Closer Fulfillment</div>", unsafe_allow_html=True)
 
-    if len(state_orders) > 0:
-        state_orders[["nearest_fc", "dist_km"]] = state_orders["City"].apply(
-            lambda c: pd.Series(nearest_fc_distance(c)))
-        state_orders = state_orders.dropna(subset=["dist_km"])
+    state_city_metrics = fdf.groupby(["State", "City"]).agg(Orders=("SKU", "size"), Revenue=("Revenue", "sum")).reset_index()
+    state_city_metrics[["nearest_fc", "dist_km"]] = state_city_metrics["City"].apply(lambda c: pd.Series(nearest_fc_distance(c)))
+    state_city_metrics = state_city_metrics.dropna(subset=["dist_km"])
 
-        # Weighted avg distance per state (weighted by orders)
-        state_dist = state_orders.groupby("State").apply(
-            lambda g: np.average(g["dist_km"], weights=g["Orders"])
+    if not state_city_metrics.empty:
+        # Weighted average distance per state
+        state_dist = state_city_metrics.groupby("State").apply(
+            lambda g: np.average(g["dist_km"], weights=g["Orders"]) if g["Orders"].sum() > 0 else 0
         ).reset_index(name="Avg_Dist_km")
-        state_vol = fdf.groupby("State").size().reset_index(name="Orders")
-        state_summary = state_dist.merge(state_vol, on="State").sort_values("Avg_Dist_km", ascending=False)
-        underserved = state_summary[state_summary["Orders"] >= 3].head(5)
+        
+        state_vol = fdf.groupby("State").agg(Orders=("SKU", "size"), Revenue=("Revenue", "sum")).reset_index()
+        median_state_orders = state_vol["Orders"].median()
+        
+        state_summary = state_dist.merge(state_vol, on="State")
+        # Filter: Volume > median AND Avg Dist > 300km
+        underserved = state_summary[(state_summary["Orders"] > median_state_orders) & (state_summary["Avg_Dist_km"] > 300)]
+        # Priority: Sort by Orders descending
+        underserved = underserved.sort_values("Orders", ascending=False).head(5)
 
         for _, row in underserved.iterrows():
             st.markdown(f"""
             <div class='rec-card orange'>
-              <div class='rec-tag orange'>⚠️ Underserved State</div>
+              <div class='rec-tag orange'>⚠️ Underserved High-Volume State</div>
               <div class='rec-header'>Consider a warehouse near {row['State'].title()}</div>
               <div class='rec-body'>
-                Orders from {row['State'].title()} travel an average of <b>{int(row['Avg_Dist_km'])} km</b> to reach customers
-                — the farthest of any state in your network. With <b>{int(row['Orders'])} orders</b> in the last 30 days,
-                this state has enough volume to justify closer fulfilment. A warehouse here could
-                reduce delivery time and shipping costs significantly.
+                Orders travel an average of <b>{int(row['Avg_Dist_km'])} km</b>. 
+                Volume: <b>{int(row['Orders'])} orders</b> | Revenue: <b>₹{row['Revenue']:,.2f}</b>. 
+                Distance exceeds the 300km efficiency threshold. Closer fulfillment will reduce shipping costs.
               </div>
             </div>""", unsafe_allow_html=True)
     else:
-        st.info("Not enough location data to compute warehouse gaps.")
+        st.info("Insufficient location data to compute state-level gaps.")
+
+    # ── 2. Shipping Inefficiency: High-demand cities > 300km from FC ──────────
+    st.markdown("<div class='section-title'>🏙️ High-Demand Cities Exceeding 300km Distance Threshold</div>", unsafe_allow_html=True)
+
+    city_metrics[["nearest_fc", "dist_km"]] = city_metrics["City"].apply(lambda c: pd.Series(nearest_fc_distance(c)))
+    city_metrics = city_metrics.dropna(subset=["dist_km"])
+    
+    gap_cities = city_metrics[
+        (city_metrics["Orders"] > median_city_orders) & 
+        (city_metrics["dist_km"] > 300)
+    ].sort_values("Orders", ascending=False).head(5)
+
+    if not gap_cities.empty:
+        for _, row in gap_cities.iterrows():
+            st.markdown(f"""
+            <div class='rec-card red'>
+              <div class='rec-tag red'>📍 Distance Inefficiency</div>
+              <div class='rec-header'>{row['City'].title()} — {int(row['Orders'])} orders | ₹{row['Revenue']:,.2f} Revenue</div>
+              <div class='rec-body'>
+                Served from <b>{row['nearest_fc']}</b> (<b>{int(row['dist_km'])} km away</b>). 
+                Order volume exceeds the city median ({median_city_orders}), but shipping distance causes high transit times. Evaluate local 3PL integration.
+              </div>
+            </div>""", unsafe_allow_html=True)
+    else:
+        st.success("No high-volume cities exceed the 300km threshold.")
+
+    # ── 3. Regional Isolation: SKUs restricted to a single state ──────────────
+    st.markdown("<div class='section-title'>🔍 Unexploited Markets (Regionally Isolated SKUs)</div>", unsafe_allow_html=True)
+
+    sku_state = fdf.groupby(["SKU", "State"]).agg(Orders=("City", "size"), Revenue=("Revenue", "sum")).reset_index()
+    sku_state_count = sku_state.groupby("SKU")["State"].nunique().reset_index(name="State_Count")
+    isolated_skus = sku_state_count[sku_state_count["State_Count"] == 1].merge(sku_metrics, on="SKU")
+    
+    # Filter: Only flag if isolated SKU volume is greater than the median SKU volume
+    isolated_skus = isolated_skus[isolated_skus["Orders"] > median_sku_orders].sort_values("Orders", ascending=False)
+
+    if not isolated_skus.empty:
+        for _, row in isolated_skus.iterrows():
+            state_name = sku_state[sku_state["SKU"] == row["SKU"]]["State"].iloc[0]
+            st.markdown(f"""
+            <div class='rec-card purple'>
+              <div class='rec-tag purple'>🚀 Regional Concentration</div>
+              <div class='rec-header'>{row['SKU']} — 100% of sales isolated to {state_name.title()}</div>
+              <div class='rec-body'>
+                Volume: <b>{int(row['Orders'])} orders</b> | Revenue: <b>₹{row['Revenue']:,.2f}</b>.
+                Despite high performance (> median of {median_sku_orders} orders), zero sales exist outside {state_name.title()}. Adjust advertising campaigns targeting other regions.
+              </div>
+            </div>""", unsafe_allow_html=True)
+    else:
+        st.info("No high-volume SKUs are strictly isolated to a single state.")
+
+    # ── 4. Underperforming Nodes: WoW Decline in SKUs ─────────────────────────
+    st.markdown("<div class='section-title'>📉 SKUs Showing Week-over-Week Decline</div>", unsafe_allow_html=True)
+
+    if fdf["Date"].nunique() >= 14:
+        trend_df = fdf.copy()
+        trend_df["Week"] = trend_df["Date"].dt.to_period("W")
+        weekly_sku = trend_df.groupby(["Week", "SKU"]).agg(Orders=("City", "size"), Revenue=("Revenue", "sum")).reset_index()
+        weeks_sorted = sorted(weekly_sku["Week"].unique())
+
+        if len(weeks_sorted) >= 2:
+            last_week = weeks_sorted[-1]
+            prev_week = weeks_sorted[-2]
+            
+            lw = weekly_sku[weekly_sku["Week"] == last_week][["SKU", "Orders", "Revenue"]].rename(columns={"Orders": "LW_Orders", "Revenue": "LW_Rev"})
+            pw = weekly_sku[weekly_sku["Week"] == prev_week][["SKU", "Orders", "Revenue"]].rename(columns={"Orders": "PW_Orders", "Revenue": "PW_Rev"})
+            
+            wow = lw.merge(pw, on="SKU", how="inner")
+            wow["Growth_pct"] = ((wow["LW_Orders"] - wow["PW_Orders"]) / wow["PW_Orders"].replace(0, 1) * 100).round(1)
+            
+            # Filter: Declining growth AND previous week volume was > median
+            declining = wow[(wow["Growth_pct"] < 0) & (wow["PW_Orders"] > median_sku_orders)].sort_values("LW_Orders", ascending=False).head(5)
+
+            if not declining.empty:
+                for _, row in declining.iterrows():
+                    st.markdown(f"""
+                    <div class='rec-card red'>
+                      <div class='rec-tag red'>📉 Volume Decline</div>
+                      <div class='rec-header'>{row['SKU']} — down {abs(row['Growth_pct'])}% week-over-week</div>
+                      <div class='rec-body'>
+                        Orders dropped from <b>{int(row['PW_Orders'])}</b> to <b>{int(row['LW_Orders'])}</b>.
+                        Revenue dropped from <b>₹{row['PW_Rev']:,.2f}</b> to <b>₹{row['LW_Rev']:,.2f}</b>.
+                        Investigate stock availability, buy-box status, or ad spend for this SKU.
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.info("No high-volume SKUs showed a week-over-week decline.")
+        else:
+            st.info("Requires at least 2 weeks of data to compute week-over-week declines.")
+    else:
+        st.info("Requires at least 14 days of data to compute weekly trends.")
 
     # ── 2. Cities with high demand but far from any FC ────────────────────────
     st.markdown("<div class='section-title'>🏙️ High-demand cities far from any warehouse</div>", unsafe_allow_html=True)
